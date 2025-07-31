@@ -42,16 +42,15 @@ cp .env.sample .env
 ```bash
 # Required for LLM operations
 OPENAI_API_KEY=your_openai_api_key_here
-MODEL_NAME=gpt-4o
+MODEL_NAME=gpt-4.1-mini
 
-# Optional: Custom OpenAI endpoint
+# Optional: Custom OpenAI endpoint (e.g., for proxies)
 # OPENAI_BASE_URL=https://api.openai.com/v1
 
 # Neo4j Configuration (defaults work with Docker)
 NEO4J_URI=bolt://neo4j:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=demodemo
-EOF
 ```
 
 4. Start the services:
@@ -72,7 +71,7 @@ docker compose logs graphiti-mcp
 
 You can run with environment variables directly:
 ```bash
-OPENAI_API_KEY=your_key MODEL_NAME=gpt-4o docker compose up
+OPENAI_API_KEY=your_key MODEL_NAME=gpt-4.1-mini docker compose up
 ```
 
 ## 🔧 Configuration
@@ -87,14 +86,53 @@ OPENAI_API_KEY=your_key MODEL_NAME=gpt-4o docker compose up
 
 ### Environment Variables 🔧
 
+#### OpenAI Configuration
+
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `OPENAI_API_KEY` | ✅ | - | Your OpenAI API key |
-| `MODEL_NAME` | ❌ | `gpt-4o` | OpenAI model to use |
-| `OPENAI_BASE_URL` | ❌ | - | Custom OpenAI endpoint |
+| `OPENAI_BASE_URL` | ❌ | - | Custom OpenAI API endpoint (consumed by OpenAI SDK) |
+| `MODEL_NAME` | ❌ | `gpt-4.1-mini` | Main LLM model to use |
+| `SMALL_MODEL_NAME` | ❌ | `gpt-4.1-nano` | Small LLM model for lighter tasks |
+| `LLM_TEMPERATURE` | ❌ | `0.0` | LLM temperature (0.0-2.0) |
+| `EMBEDDER_MODEL_NAME` | ❌ | `text-embedding-3-small` | Embedding model |
+
+#### Neo4j Configuration
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
 | `NEO4J_URI` | ❌ | `bolt://neo4j:7687` | Neo4j connection URI |
 | `NEO4J_USER` | ❌ | `neo4j` | Neo4j username |
 | `NEO4J_PASSWORD` | ❌ | `demodemo` | Neo4j password |
+
+#### Server Configuration
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `MCP_SERVER_HOST` | ❌ | - | MCP server host binding |
+| `SEMAPHORE_LIMIT` | ❌ | `10` | Concurrent operation limit for LLM calls |
+
+#### Azure OpenAI Configuration (Optional)
+
+For Azure OpenAI deployments, use these environment variables instead of the standard OpenAI configuration:
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `AZURE_OPENAI_ENDPOINT` | ✅* | - | Azure OpenAI endpoint URL |
+| `AZURE_OPENAI_API_VERSION` | ✅* | - | Azure OpenAI API version |
+| `AZURE_OPENAI_DEPLOYMENT_NAME` | ✅* | - | Azure OpenAI deployment name |
+| `AZURE_OPENAI_USE_MANAGED_IDENTITY` | ❌ | `false` | Use Azure managed identity for auth |
+| `AZURE_OPENAI_EMBEDDING_ENDPOINT` | ❌ | - | Separate endpoint for embeddings |
+| `AZURE_OPENAI_EMBEDDING_API_VERSION` | ❌ | - | API version for embeddings |
+| `AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME` | ❌ | - | Deployment name for embeddings |
+| `AZURE_OPENAI_EMBEDDING_API_KEY` | ❌ | - | Separate API key for embeddings |
+
+\* Required when using Azure OpenAI
+
+**Notes:**
+- `OPENAI_BASE_URL` is consumed directly by the OpenAI Python SDK, useful for proxy configurations or custom endpoints
+- `SEMAPHORE_LIMIT` controls concurrent LLM API calls - decrease if you encounter rate limits, increase for higher throughput
+- Azure configuration is an alternative to standard OpenAI - don't mix both configurations
 
 ### Neo4j Settings 🗄️
 
@@ -108,7 +146,16 @@ Default configuration for Neo4j:
 
 You can run with environment variables directly:
 ```bash
-OPENAI_API_KEY=your_key MODEL_NAME=gpt-4o docker compose up
+OPENAI_API_KEY=your_key MODEL_NAME=gpt-4.1-mini docker compose up
+```
+
+For Azure OpenAI:
+```bash
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com \
+AZURE_OPENAI_API_VERSION=2024-02-01 \
+AZURE_OPENAI_DEPLOYMENT_NAME=your-deployment \
+OPENAI_API_KEY=your_key \
+docker compose up
 ```
 
 ## 🔌 Integration

@@ -8,17 +8,23 @@ import asyncio
 import logging
 import os
 import sys
-import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Optional, TypedDict, Union, cast
+from typing import Any, TypedDict, cast
 
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from openai import AsyncAzureOpenAI
 from pydantic import BaseModel, Field
 
 from graphiti_core import Graphiti
 from graphiti_core.edges import EntityEdge
+from graphiti_core.embedder.azure_openai import AzureOpenAIEmbedderClient
+from graphiti_core.embedder.client import EmbedderClient
+from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.llm_client import LLMClient
+from graphiti_core.llm_client.azure_openai_client import AzureOpenAILLMClient
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.nodes import EpisodeType, EpisodicNode
@@ -31,7 +37,15 @@ from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 
 load_dotenv()
 
-DEFAULT_LLM_MODEL = 'gpt-4o'
+
+DEFAULT_LLM_MODEL = 'gpt-4.1-mini'
+SMALL_LLM_MODEL = 'gpt-4.1-nano'
+DEFAULT_EMBEDDER_MODEL = 'text-embedding-3-small'
+
+# Semaphore limit for concurrent Graphiti operations.
+# Decrease this if you're experiencing 429 rate limit errors from your LLM provider.
+# Increase if you have high rate limits.
+SEMAPHORE_LIMIT = int(os.getenv('SEMAPHORE_LIMIT', 10))
 
 
 class Requirement(BaseModel):
@@ -153,40 +167,357 @@ class StatusResponse(TypedDict):
     message: str
 
 
+def create_azure_credential_token_provider() -> Callable[[], str]:
+    credential = DefaultAzureCredential()
+    token_provider = get_bearer_token_provider(
+        credential, 'https://cognitiveservices.azure.com/.default'
+    )
+    return token_provider
+
+
 # Server configuration classes
+# The configuration system has a hierarchy:
+# - GraphitiConfig is the top-level configuration
+#   - LLMConfig handles all OpenAI/LLM related settings
+#   - EmbedderConfig manages embedding settings
+#   - Neo4jConfig manages database connection details
+#   - Various other settings like group_id and feature flags
+# Configuration values are loaded from:
+# 1. Default values in the class definitions
+# 2. Environment variables (loaded via load_dotenv())
+# 3. Command line arguments (which override environment variables)
+class GraphitiLLMConfig(BaseModel):
+    """Configuration for the LLM client.
+
+    Centralizes all LLM-specific configuration parameters including API keys and model selection.
+    """
+
+    api_key: str | None = None
+    model: str = DEFAULT_LLM_MODEL
+    small_model: str = SMALL_LLM_MODEL
+    temperature: float = 0.0
+    azure_openai_endpoint: str | None = None
+    azure_openai_deployment_name: str | None = None
+    azure_openai_api_version: str | None = None
+    azure_openai_use_managed_identity: bool = False
+
+    @classmethod
+    def from_env(cls) -> 'GraphitiLLMConfig':
+        """Create LLM configuration from environment variables."""
+        # Get model from environment, or use default if not set or empty
+        model_env = os.environ.get('MODEL_NAME', '')
+        model = model_env if model_env.strip() else DEFAULT_LLM_MODEL
+
+        # Get small_model from environment, or use default if not set or empty
+        small_model_env = os.environ.get('SMALL_MODEL_NAME', '')
+        small_model = small_model_env if small_model_env.strip() else SMALL_LLM_MODEL
+
+        azure_openai_endpoint = os.environ.get('AZURE_OPENAI_ENDPOINT', None)
+        azure_openai_api_version = os.environ.get('AZURE_OPENAI_API_VERSION', None)
+        azure_openai_deployment_name = os.environ.get('AZURE_OPENAI_DEPLOYMENT_NAME', None)
+        azure_openai_use_managed_identity = (
+            os.environ.get('AZURE_OPENAI_USE_MANAGED_IDENTITY', 'false').lower() == 'true'
+        )
+
+        if azure_openai_endpoint is None:
+            # Setup for OpenAI API
+            # Log if empty model was provided
+            if model_env == '':
+                logger.debug(
+                    f'MODEL_NAME environment variable not set, using default: {DEFAULT_LLM_MODEL}'
+                )
+            elif not model_env.strip():
+                logger.warning(
+                    f'Empty MODEL_NAME environment variable, using default: {DEFAULT_LLM_MODEL}'
+                )
+
+            return cls(
+                api_key=os.environ.get('OPENAI_API_KEY'),
+                model=model,
+                small_model=small_model,
+                temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
+            )
+        else:
+            # Setup for Azure OpenAI API
+            # Log if empty deployment name was provided
+            if azure_openai_deployment_name is None:
+                logger.error('AZURE_OPENAI_DEPLOYMENT_NAME environment variable not set')
+
+                raise ValueError('AZURE_OPENAI_DEPLOYMENT_NAME environment variable not set')
+            if not azure_openai_use_managed_identity:
+                # api key
+                api_key = os.environ.get('OPENAI_API_KEY', None)
+            else:
+                # Managed identity
+                api_key = None
+
+            return cls(
+                azure_openai_use_managed_identity=azure_openai_use_managed_identity,
+                azure_openai_endpoint=azure_openai_endpoint,
+                api_key=api_key,
+                azure_openai_api_version=azure_openai_api_version,
+                azure_openai_deployment_name=azure_openai_deployment_name,
+                model=model,
+                small_model=small_model,
+                temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
+            )
+
+    @classmethod
+    def from_cli_and_env(cls, args: argparse.Namespace) -> 'GraphitiLLMConfig':
+        """Create LLM configuration from CLI arguments, falling back to environment variables."""
+        # Start with environment-based config
+        config = cls.from_env()
+
+        # CLI arguments override environment variables when provided
+        if hasattr(args, 'model') and args.model:
+            # Only use CLI model if it's not empty
+            if args.model.strip():
+                config.model = args.model
+            else:
+                # Log that empty model was provided and default is used
+                logger.warning(f'Empty model name provided, using default: {DEFAULT_LLM_MODEL}')
+
+        if hasattr(args, 'small_model') and args.small_model:
+            if args.small_model.strip():
+                config.small_model = args.small_model
+            else:
+                logger.warning(f'Empty small_model name provided, using default: {SMALL_LLM_MODEL}')
+
+        if hasattr(args, 'temperature') and args.temperature is not None:
+            config.temperature = args.temperature
+
+        return config
+
+    def create_client(self) -> LLMClient:
+        """Create an LLM client based on this configuration.
+
+        Returns:
+            LLMClient instance
+        """
+
+        if self.azure_openai_endpoint is not None:
+            # Azure OpenAI API setup
+            if self.azure_openai_use_managed_identity:
+                # Use managed identity for authentication
+                token_provider = create_azure_credential_token_provider()
+                return AzureOpenAILLMClient(
+                    azure_client=AsyncAzureOpenAI(
+                        azure_endpoint=self.azure_openai_endpoint,
+                        azure_deployment=self.azure_openai_deployment_name,
+                        api_version=self.azure_openai_api_version,
+                        azure_ad_token_provider=token_provider,
+                    ),
+                    config=LLMConfig(
+                        api_key=self.api_key,
+                        model=self.model,
+                        small_model=self.small_model,
+                        temperature=self.temperature,
+                    ),
+                )
+            elif self.api_key:
+                # Use API key for authentication
+                return AzureOpenAILLMClient(
+                    azure_client=AsyncAzureOpenAI(
+                        azure_endpoint=self.azure_openai_endpoint,
+                        azure_deployment=self.azure_openai_deployment_name,
+                        api_version=self.azure_openai_api_version,
+                        api_key=self.api_key,
+                    ),
+                    config=LLMConfig(
+                        api_key=self.api_key,
+                        model=self.model,
+                        small_model=self.small_model,
+                        temperature=self.temperature,
+                    ),
+                )
+            else:
+                raise ValueError('OPENAI_API_KEY must be set when using Azure OpenAI API')
+
+        if not self.api_key:
+            raise ValueError('OPENAI_API_KEY must be set when using OpenAI API')
+
+        llm_client_config = LLMConfig(
+            api_key=self.api_key, model=self.model, small_model=self.small_model
+        )
+
+        # Set temperature
+        llm_client_config.temperature = self.temperature
+
+        return OpenAIClient(config=llm_client_config)
+
+
+class GraphitiEmbedderConfig(BaseModel):
+    """Configuration for the embedder client.
+
+    Centralizes all embedding-related configuration parameters.
+    """
+
+    model: str = DEFAULT_EMBEDDER_MODEL
+    api_key: str | None = None
+    azure_openai_endpoint: str | None = None
+    azure_openai_deployment_name: str | None = None
+    azure_openai_api_version: str | None = None
+    azure_openai_use_managed_identity: bool = False
+
+    @classmethod
+    def from_env(cls) -> 'GraphitiEmbedderConfig':
+        """Create embedder configuration from environment variables."""
+
+        # Get model from environment, or use default if not set or empty
+        model_env = os.environ.get('EMBEDDER_MODEL_NAME', '')
+        model = model_env if model_env.strip() else DEFAULT_EMBEDDER_MODEL
+
+        azure_openai_endpoint = os.environ.get('AZURE_OPENAI_EMBEDDING_ENDPOINT', None)
+        azure_openai_api_version = os.environ.get('AZURE_OPENAI_EMBEDDING_API_VERSION', None)
+        azure_openai_deployment_name = os.environ.get(
+            'AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME', None
+        )
+        azure_openai_use_managed_identity = (
+            os.environ.get('AZURE_OPENAI_USE_MANAGED_IDENTITY', 'false').lower() == 'true'
+        )
+        if azure_openai_endpoint is not None:
+            # Setup for Azure OpenAI API
+            # Log if empty deployment name was provided
+            azure_openai_deployment_name = os.environ.get(
+                'AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME', None
+            )
+            if azure_openai_deployment_name is None:
+                logger.error('AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME environment variable not set')
+
+                raise ValueError(
+                    'AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME environment variable not set'
+                )
+
+            if not azure_openai_use_managed_identity:
+                # api key
+                api_key = os.environ.get('AZURE_OPENAI_EMBEDDING_API_KEY', None) or os.environ.get(
+                    'OPENAI_API_KEY', None
+                )
+            else:
+                # Managed identity
+                api_key = None
+
+            return cls(
+                azure_openai_use_managed_identity=azure_openai_use_managed_identity,
+                azure_openai_endpoint=azure_openai_endpoint,
+                api_key=api_key,
+                azure_openai_api_version=azure_openai_api_version,
+                azure_openai_deployment_name=azure_openai_deployment_name,
+            )
+        else:
+            return cls(
+                model=model,
+                api_key=os.environ.get('OPENAI_API_KEY'),
+            )
+
+    def create_client(self) -> EmbedderClient | None:
+        if self.azure_openai_endpoint is not None:
+            # Azure OpenAI API setup
+            if self.azure_openai_use_managed_identity:
+                # Use managed identity for authentication
+                token_provider = create_azure_credential_token_provider()
+                return AzureOpenAIEmbedderClient(
+                    azure_client=AsyncAzureOpenAI(
+                        azure_endpoint=self.azure_openai_endpoint,
+                        azure_deployment=self.azure_openai_deployment_name,
+                        api_version=self.azure_openai_api_version,
+                        azure_ad_token_provider=token_provider,
+                    ),
+                    model=self.model,
+                )
+            elif self.api_key:
+                # Use API key for authentication
+                return AzureOpenAIEmbedderClient(
+                    azure_client=AsyncAzureOpenAI(
+                        azure_endpoint=self.azure_openai_endpoint,
+                        azure_deployment=self.azure_openai_deployment_name,
+                        api_version=self.azure_openai_api_version,
+                        api_key=self.api_key,
+                    ),
+                    model=self.model,
+                )
+            else:
+                logger.error('OPENAI_API_KEY must be set when using Azure OpenAI API')
+                return None
+        else:
+            # OpenAI API setup
+            if not self.api_key:
+                return None
+
+            embedder_config = OpenAIEmbedderConfig(api_key=self.api_key, embedding_model=self.model)
+
+            return OpenAIEmbedder(config=embedder_config)
+
+
+class Neo4jConfig(BaseModel):
+    """Configuration for Neo4j database connection."""
+
+    uri: str = 'bolt://localhost:7687'
+    user: str = 'neo4j'
+    password: str = 'password'
+
+    @classmethod
+    def from_env(cls) -> 'Neo4jConfig':
+        """Create Neo4j configuration from environment variables."""
+        return cls(
+            uri=os.environ.get('NEO4J_URI', 'bolt://localhost:7687'),
+            user=os.environ.get('NEO4J_USER', 'neo4j'),
+            password=os.environ.get('NEO4J_PASSWORD', 'password'),
+        )
+
+
 class GraphitiConfig(BaseModel):
     """Configuration for Graphiti client.
 
-    Centralizes all configuration parameters for the Graphiti client,
-    including database connection details and LLM settings.
+    Centralizes all configuration parameters for the Graphiti client.
     """
 
-    neo4j_uri: str = 'bolt://localhost:7687'
-    neo4j_user: str = 'neo4j'
-    neo4j_password: str = 'password'
-    openai_api_key: Optional[str] = None
-    openai_base_url: Optional[str] = None
-    model_name: Optional[str] = None
-    group_id: Optional[str] = None
+    llm: GraphitiLLMConfig = Field(default_factory=GraphitiLLMConfig)
+    embedder: GraphitiEmbedderConfig = Field(default_factory=GraphitiEmbedderConfig)
+    neo4j: Neo4jConfig = Field(default_factory=Neo4jConfig)
+    group_id: str | None = None
     use_custom_entities: bool = False
+    destroy_graph: bool = False
 
     @classmethod
     def from_env(cls) -> 'GraphitiConfig':
         """Create a configuration instance from environment variables."""
         return cls(
-            neo4j_uri=os.environ.get('NEO4J_URI', 'bolt://localhost:7687'),
-            neo4j_user=os.environ.get('NEO4J_USER', 'neo4j'),
-            neo4j_password=os.environ.get('NEO4J_PASSWORD', 'password'),
-            openai_api_key=os.environ.get('OPENAI_API_KEY'),
-            openai_base_url=os.environ.get('OPENAI_BASE_URL'),
-            model_name=os.environ.get('MODEL_NAME'),
+            llm=GraphitiLLMConfig.from_env(),
+            embedder=GraphitiEmbedderConfig.from_env(),
+            neo4j=Neo4jConfig.from_env(),
         )
+
+    @classmethod
+    def from_cli_and_env(cls, args: argparse.Namespace) -> 'GraphitiConfig':
+        """Create configuration from CLI arguments, falling back to environment variables."""
+        # Start with environment configuration
+        config = cls.from_env()
+
+        # Apply CLI overrides
+        if args.group_id:
+            config.group_id = args.group_id
+        else:
+            config.group_id = 'default'
+
+        config.use_custom_entities = args.use_custom_entities
+        config.destroy_graph = args.destroy_graph
+
+        # Update LLM config using CLI args
+        config.llm = GraphitiLLMConfig.from_cli_and_env(args)
+
+        return config
 
 
 class MCPConfig(BaseModel):
     """Configuration for MCP server."""
 
-    transport: str
+    transport: str = 'sse'  # Default to SSE transport
+
+    @classmethod
+    def from_cli(cls, args: argparse.Namespace) -> 'MCPConfig':
+        """Create MCP configuration from CLI arguments."""
+        return cls(transport=args.transport)
 
 
 # Configure logging
@@ -197,12 +528,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create global config instance
-config = GraphitiConfig.from_env()
+# Create global config instance - will be properly initialized later
+config = GraphitiConfig()
 
 # MCP server instructions
 GRAPHITI_MCP_INSTRUCTIONS = """
-Welcome to Graphiti MCP - a memory service for AI agents built on a knowledge graph. Graphiti performs well
+Graphiti is a memory service for AI agents built on a knowledge graph. Graphiti performs well
 with dynamic data such as user interactions, changing enterprise data, and external information.
 
 Graphiti transforms information into a richly connected knowledge network, allowing you to 
@@ -215,7 +546,7 @@ Facts contain temporal metadata, allowing you to track the time of creation and 
 (superseded by new information).
 
 Key capabilities:
-1. Add episodes (text, messages, or JSON) to the knowledge graph with the add_episode tool
+1. Add episodes (text, messages, or JSON) to the knowledge graph with the add_memory tool
 2. Search for nodes (entities) in the graph using natural language queries with search_nodes
 3. Find relevant facts (relationships between entities) with search_facts
 4. Retrieve specific entity edges or episodes by UUID
@@ -231,56 +562,68 @@ For optimal performance, ensure the database is properly configured and accessib
 API keys are provided for any language model operations.
 """
 
-
 # MCP server instance
 mcp = FastMCP(
-    'graphiti',
-    instructions=GRAPHITI_MCP_INSTRUCTIONS,
+    'Graphiti Agent Memory',
+    instructions=GRAPHITI_MCP_INSTRUCTIONS
 )
 
-
 # Initialize Graphiti client
-graphiti_client: Optional[Graphiti] = None
+graphiti_client: Graphiti | None = None
 
 
-async def initialize_graphiti(llm_client: Optional[LLMClient] = None, destroy_graph: bool = False):
-    """Initialize the Graphiti client with the provided settings.
+async def initialize_graphiti():
+    """Initialize the Graphiti client with the configured settings."""
+    global graphiti_client, config
 
-    Args:
-        llm_client: Optional LLMClient instance to use for LLM operations
-        destroy_graph: Optional boolean to destroy all Graphiti graphs
-    """
-    global graphiti_client
+    try:
+        # Create LLM client if possible
+        llm_client = config.llm.create_client()
+        if not llm_client and config.use_custom_entities:
+            # If custom entities are enabled, we must have an LLM client
+            raise ValueError('OPENAI_API_KEY must be set when custom entities are enabled')
 
-    # If no client is provided, create a default OpenAI client
-    if not llm_client:
-        if config.openai_api_key:
-            llm_config = LLMConfig(api_key=config.openai_api_key)
-            if config.openai_base_url:
-                llm_config.base_url = config.openai_base_url
-            if config.model_name:
-                llm_config.model = config.model_name
-            llm_client = OpenAIClient(config=llm_config)
+        # Validate Neo4j configuration
+        if not config.neo4j.uri or not config.neo4j.user or not config.neo4j.password:
+            raise ValueError('NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD must be set')
+
+        embedder_client = config.embedder.create_client()
+
+        # Initialize Graphiti client
+        graphiti_client = Graphiti(
+            uri=config.neo4j.uri,
+            user=config.neo4j.user,
+            password=config.neo4j.password,
+            llm_client=llm_client,
+            embedder=embedder_client,
+            max_coroutines=SEMAPHORE_LIMIT,
+        )
+
+        # Destroy graph if requested
+        if config.destroy_graph:
+            logger.info('Destroying graph...')
+            await clear_data(graphiti_client.driver)
+
+        # Initialize the graph database with Graphiti's indices
+        await graphiti_client.build_indices_and_constraints()
+        logger.info('Graphiti client initialized successfully')
+
+        # Log configuration details for transparency
+        if llm_client:
+            logger.info(f'Using OpenAI model: {config.llm.model}')
+            logger.info(f'Using temperature: {config.llm.temperature}')
         else:
-            raise ValueError('OPENAI_API_KEY must be set when not using a custom LLM client')
+            logger.info('No LLM client configured - entity extraction will be limited')
 
-    if not config.neo4j_uri or not config.neo4j_user or not config.neo4j_password:
-        raise ValueError('NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD must be set')
+        logger.info(f'Using group_id: {config.group_id}')
+        logger.info(
+            f'Custom entity extraction: {"enabled" if config.use_custom_entities else "disabled"}'
+        )
+        logger.info(f'Using concurrency limit: {SEMAPHORE_LIMIT}')
 
-    graphiti_client = Graphiti(
-        uri=config.neo4j_uri,
-        user=config.neo4j_user,
-        password=config.neo4j_password,
-        llm_client=llm_client,
-    )
-
-    if destroy_graph:
-        logger.info('Destroying graph...')
-        await clear_data(graphiti_client.driver)
-
-    # Initialize the graph database with Graphiti's indices
-    await graphiti_client.build_indices_and_constraints()
-    logger.info('Graphiti client initialized successfully')
+    except Exception as e:
+        logger.error(f'Failed to initialize Graphiti: {str(e)}')
+        raise
 
 
 def format_fact_result(edge: EntityEdge) -> dict[str, Any]:
@@ -294,12 +637,14 @@ def format_fact_result(edge: EntityEdge) -> dict[str, Any]:
     Returns:
         A dictionary representation of the edge with serialized dates and excluded embeddings
     """
-    return edge.model_dump(
+    result = edge.model_dump(
         mode='json',
         exclude={
             'fact_embedding',
         },
     )
+    result.get('attributes', {}).pop('fact_embedding', None)
+    return result
 
 
 # Dictionary to store queues for each group_id
@@ -344,24 +689,24 @@ async def process_episode_queue(group_id: str):
 
 
 @mcp.tool()
-async def add_episode(
+async def add_memory(
     name: str,
     episode_body: str,
-    group_id: Optional[str] = None,
+    group_id: str | None = None,
     source: str = 'text',
     source_description: str = '',
-    uuid: Optional[str] = None,
-) -> Union[SuccessResponse, ErrorResponse]:
-    """Add an episode to the Graphiti knowledge graph. This is the primary way to add information to the graph.
+    uuid: str | None = None,
+) -> SuccessResponse | ErrorResponse:
+    """Add an episode to memory. This is the primary way to add information to the graph.
 
     This function returns immediately and processes the episode addition in the background.
     Episodes for the same group_id are processed sequentially to avoid race conditions.
 
     Args:
         name (str): Name of the episode
-        episode_body (str): The content of the episode. When source='json', this must be a properly escaped JSON string,
-                           not a raw Python dictionary. The JSON data will be automatically processed
-                           to extract entities and relationships.
+        episode_body (str): The content of the episode to persist to memory. When source='json', this must be a
+                           properly escaped JSON string, not a raw Python dictionary. The JSON data will be
+                           automatically processed to extract entities and relationships.
         group_id (str, optional): A unique ID for this graph. If not provided, uses the default group_id from CLI
                                  or a generated one.
         source (str, optional): Source type, must be one of:
@@ -373,7 +718,7 @@ async def add_episode(
 
     Examples:
         # Adding plain text content
-        add_episode(
+        add_memory(
             name="Company News",
             episode_body="Acme Corp announced a new product line today.",
             source="text",
@@ -383,7 +728,7 @@ async def add_episode(
 
         # Adding structured JSON data
         # NOTE: episode_body must be a properly escaped JSON string. Note the triple backslashes
-        add_episode(
+        add_memory(
             name="Customer Profile",
             episode_body="{\\\"company\\\": {\\\"name\\\": \\\"Acme Technologies\\\"}, \\\"products\\\": [{\\\"id\\\": \\\"P001\\\", \\\"name\\\": \\\"CloudSync\\\"}, {\\\"id\\\": \\\"P002\\\", \\\"name\\\": \\\"DataMiner\\\"}]}",
             source="json",
@@ -391,7 +736,7 @@ async def add_episode(
         )
 
         # Adding message-style content
-        add_episode(
+        add_memory(
             name="Customer Conversation",
             episode_body="user: What's your return policy?\nassistant: You can return items within 30 days.",
             source="message",
@@ -410,7 +755,7 @@ async def add_episode(
     global graphiti_client, episode_queues, queue_workers
 
     if graphiti_client is None:
-        return {'error': 'Graphiti client not initialized'}
+        return ErrorResponse(error='Graphiti client not initialized')
 
     try:
         # Map string source to EpisodeType enum
@@ -453,9 +798,6 @@ async def add_episode(
                 )
                 logger.info(f"Episode '{name}' added successfully")
 
-                logger.info(f"Building communities after episode '{name}'")
-                await client.build_communities()
-
                 logger.info(f"Episode '{name}' processed successfully")
             except Exception as e:
                 error_msg = str(e)
@@ -475,24 +817,24 @@ async def add_episode(
             asyncio.create_task(process_episode_queue(group_id_str))
 
         # Return immediately with a success message
-        return {
-            'message': f"Episode '{name}' queued for processing (position: {episode_queues[group_id_str].qsize()})"
-        }
+        return SuccessResponse(
+            message=f"Episode '{name}' queued for processing (position: {episode_queues[group_id_str].qsize()})"
+        )
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error queuing episode task: {error_msg}')
-        return {'error': f'Error queuing episode task: {error_msg}'}
+        return ErrorResponse(error=f'Error queuing episode task: {error_msg}')
 
 
 @mcp.tool()
-async def search_nodes(
+async def search_memory_nodes(
     query: str,
-    group_ids: Optional[list[str]] = None,
+    group_ids: list[str] | None = None,
     max_nodes: int = 10,
-    center_node_uuid: Optional[str] = None,
+    center_node_uuid: str | None = None,
     entity: str = '',  # cursor seems to break with None
-) -> Union[NodeSearchResponse, ErrorResponse]:
-    """Search the Graphiti knowledge graph for relevant node summaries.
+) -> NodeSearchResponse | ErrorResponse:
+    """Search the graph memory for relevant node summaries.
     These contain a summary of all of a node's relationships with other nodes.
 
     Note: entity is a single entity type to filter results (permitted: "Preference", "Procedure").
@@ -566,13 +908,13 @@ async def search_nodes(
 
 
 @mcp.tool()
-async def search_facts(
+async def search_memory_facts(
     query: str,
-    group_ids: Optional[list[str]] = None,
+    group_ids: list[str] | None = None,
     max_facts: int = 10,
-    center_node_uuid: Optional[str] = None,
-) -> Union[FactSearchResponse, ErrorResponse]:
-    """Search the Graphiti knowledge graph for relevant facts.
+    center_node_uuid: str | None = None,
+) -> FactSearchResponse | ErrorResponse:
+    """Search the graph memory for relevant facts.
 
     Args:
         query: The search query
@@ -583,9 +925,13 @@ async def search_facts(
     global graphiti_client
 
     if graphiti_client is None:
-        return {'error': 'Graphiti client not initialized'}
+        return ErrorResponse(error='Graphiti client not initialized')
 
     try:
+        # Validate max_facts parameter
+        if max_facts <= 0:
+            return ErrorResponse(error='max_facts must be a positive integer')
+
         # Use the provided group_ids or fall back to the default from config if none provided
         effective_group_ids = (
             group_ids if group_ids is not None else [config.group_id] if config.group_id else []
@@ -605,19 +951,19 @@ async def search_facts(
         )
 
         if not relevant_edges:
-            return {'message': 'No relevant facts found', 'facts': []}
+            return FactSearchResponse(message='No relevant facts found', facts=[])
 
         facts = [format_fact_result(edge) for edge in relevant_edges]
-        return {'message': 'Facts retrieved successfully', 'facts': facts}
+        return FactSearchResponse(message='Facts retrieved successfully', facts=facts)
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error searching facts: {error_msg}')
-        return {'error': f'Error searching facts: {error_msg}'}
+        return ErrorResponse(error=f'Error searching facts: {error_msg}')
 
 
 @mcp.tool()
-async def delete_entity_edge(uuid: str) -> Union[SuccessResponse, ErrorResponse]:
-    """Delete an entity edge from the Graphiti knowledge graph.
+async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
+    """Delete an entity edge from the graph memory.
 
     Args:
         uuid: UUID of the entity edge to delete
@@ -625,7 +971,7 @@ async def delete_entity_edge(uuid: str) -> Union[SuccessResponse, ErrorResponse]
     global graphiti_client
 
     if graphiti_client is None:
-        return {'error': 'Graphiti client not initialized'}
+        return ErrorResponse(error='Graphiti client not initialized')
 
     try:
         # We've already checked that graphiti_client is not None above
@@ -638,16 +984,16 @@ async def delete_entity_edge(uuid: str) -> Union[SuccessResponse, ErrorResponse]
         entity_edge = await EntityEdge.get_by_uuid(client.driver, uuid)
         # Delete the edge using its delete method
         await entity_edge.delete(client.driver)
-        return {'message': f'Entity edge with UUID {uuid} deleted successfully'}
+        return SuccessResponse(message=f'Entity edge with UUID {uuid} deleted successfully')
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error deleting entity edge: {error_msg}')
-        return {'error': f'Error deleting entity edge: {error_msg}'}
+        return ErrorResponse(error=f'Error deleting entity edge: {error_msg}')
 
 
 @mcp.tool()
-async def delete_episode(uuid: str) -> Union[SuccessResponse, ErrorResponse]:
-    """Delete an episode from the Graphiti knowledge graph.
+async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
+    """Delete an episode from the graph memory.
 
     Args:
         uuid: UUID of the episode to delete
@@ -655,7 +1001,7 @@ async def delete_episode(uuid: str) -> Union[SuccessResponse, ErrorResponse]:
     global graphiti_client
 
     if graphiti_client is None:
-        return {'error': 'Graphiti client not initialized'}
+        return ErrorResponse(error='Graphiti client not initialized')
 
     try:
         # We've already checked that graphiti_client is not None above
@@ -668,16 +1014,16 @@ async def delete_episode(uuid: str) -> Union[SuccessResponse, ErrorResponse]:
         episodic_node = await EpisodicNode.get_by_uuid(client.driver, uuid)
         # Delete the node using its delete method
         await episodic_node.delete(client.driver)
-        return {'message': f'Episode with UUID {uuid} deleted successfully'}
+        return SuccessResponse(message=f'Episode with UUID {uuid} deleted successfully')
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error deleting episode: {error_msg}')
-        return {'error': f'Error deleting episode: {error_msg}'}
+        return ErrorResponse(error=f'Error deleting episode: {error_msg}')
 
 
 @mcp.tool()
-async def get_entity_edge(uuid: str) -> Union[dict[str, Any], ErrorResponse]:
-    """Get an entity edge from the Graphiti knowledge graph by its UUID.
+async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
+    """Get an entity edge from the graph memory by its UUID.
 
     Args:
         uuid: UUID of the entity edge to retrieve
@@ -685,7 +1031,7 @@ async def get_entity_edge(uuid: str) -> Union[dict[str, Any], ErrorResponse]:
     global graphiti_client
 
     if graphiti_client is None:
-        return {'error': 'Graphiti client not initialized'}
+        return ErrorResponse(error='Graphiti client not initialized')
 
     try:
         # We've already checked that graphiti_client is not None above
@@ -703,14 +1049,14 @@ async def get_entity_edge(uuid: str) -> Union[dict[str, Any], ErrorResponse]:
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error getting entity edge: {error_msg}')
-        return {'error': f'Error getting entity edge: {error_msg}'}
+        return ErrorResponse(error=f'Error getting entity edge: {error_msg}')
 
 
 @mcp.tool()
 async def get_episodes(
-    group_id: Optional[str] = None, last_n: int = 10
-) -> Union[list[dict[str, Any]], EpisodeSearchResponse, ErrorResponse]:
-    """Get the most recent episodes for a specific group.
+    group_id: str | None = None, last_n: int = 10
+) -> list[dict[str, Any]] | EpisodeSearchResponse | ErrorResponse:
+    """Get the most recent memory episodes for a specific group.
 
     Args:
         group_id: ID of the group to retrieve episodes from. If not provided, uses the default group_id.
@@ -719,14 +1065,14 @@ async def get_episodes(
     global graphiti_client
 
     if graphiti_client is None:
-        return {'error': 'Graphiti client not initialized'}
+        return ErrorResponse(error='Graphiti client not initialized')
 
     try:
         # Use the provided group_id or fall back to the default from config
         effective_group_id = group_id if group_id is not None else config.group_id
 
         if not isinstance(effective_group_id, str):
-            return {'error': 'Group ID must be a string'}
+            return ErrorResponse(error='Group ID must be a string')
 
         # We've already checked that graphiti_client is not None above
         assert graphiti_client is not None
@@ -739,7 +1085,9 @@ async def get_episodes(
         )
 
         if not episodes:
-            return {'message': f'No episodes found for group {effective_group_id}', 'episodes': []}
+            return EpisodeSearchResponse(
+                message=f'No episodes found for group {effective_group_id}', episodes=[]
+            )
 
         # Use Pydantic's model_dump method for EpisodicNode serialization
         formatted_episodes = [
@@ -753,16 +1101,16 @@ async def get_episodes(
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error getting episodes: {error_msg}')
-        return {'error': f'Error getting episodes: {error_msg}'}
+        return ErrorResponse(error=f'Error getting episodes: {error_msg}')
 
 
 @mcp.tool()
-async def clear_graph() -> Union[SuccessResponse, ErrorResponse]:
-    """Clear all data from the Graphiti knowledge graph and rebuild indices."""
+async def clear_graph() -> SuccessResponse | ErrorResponse:
+    """Clear all data from the graph memory and rebuild indices."""
     global graphiti_client
 
     if graphiti_client is None:
-        return {'error': 'Graphiti client not initialized'}
+        return ErrorResponse(error='Graphiti client not initialized')
 
     try:
         # We've already checked that graphiti_client is not None above
@@ -774,11 +1122,11 @@ async def clear_graph() -> Union[SuccessResponse, ErrorResponse]:
         # clear_data is already imported at the top
         await clear_data(client.driver)
         await client.build_indices_and_constraints()
-        return {'message': 'Graph cleared successfully and indices rebuilt'}
+        return SuccessResponse(message='Graph cleared successfully and indices rebuilt')
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error clearing graph: {error_msg}')
-        return {'error': f'Error clearing graph: {error_msg}'}
+        return ErrorResponse(error=f'Error clearing graph: {error_msg}')
 
 
 @mcp.resource('http://graphiti/status')
@@ -787,7 +1135,7 @@ async def get_status() -> StatusResponse:
     global graphiti_client
 
     if graphiti_client is None:
-        return {'status': 'error', 'message': 'Graphiti client not initialized'}
+        return StatusResponse(status='error', message='Graphiti client not initialized')
 
     try:
         # We've already checked that graphiti_client is not None above
@@ -796,41 +1144,23 @@ async def get_status() -> StatusResponse:
         # Use cast to help the type checker understand that graphiti_client is not None
         client = cast(Graphiti, graphiti_client)
 
-        # Test Neo4j connection
-        await client.driver.verify_connectivity()
-        return {'status': 'ok', 'message': 'Graphiti MCP server is running and connected to Neo4j'}
+        # Test database connection
+        await client.driver.client.verify_connectivity()  # type: ignore
+
+        return StatusResponse(
+            status='ok', message='Graphiti MCP server is running and connected to Neo4j'
+        )
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error checking Neo4j connection: {error_msg}')
-        return {
-            'status': 'error',
-            'message': f'Graphiti MCP server is running but Neo4j connection failed: {error_msg}',
-        }
-
-
-def create_llm_client(api_key: Optional[str] = None, model: Optional[str] = None) -> LLMClient:
-    """Create an OpenAI LLM client.
-
-    Args:
-        api_key: API key for the OpenAI service
-        model: Model name to use
-
-    Returns:
-        An instance of the OpenAI LLM client
-    """
-    # Create config with provided API key and model
-    llm_config = LLMConfig(api_key=api_key)
-
-    # Set model if provided
-    if model:
-        llm_config.model = model
-
-    # Create and return the client
-    return OpenAIClient(config=llm_config)
+        return StatusResponse(
+            status='error',
+            message=f'Graphiti MCP server is running but Neo4j connection failed: {error_msg}',
+        )
 
 
 async def initialize_server() -> MCPConfig:
-    """Initialize the Graphiti server with the specified LLM client."""
+    """Parse CLI arguments and initialize the Graphiti server configuration."""
     global config
 
     parser = argparse.ArgumentParser(
@@ -847,47 +1177,57 @@ async def initialize_server() -> MCPConfig:
         default='sse',
         help='Transport to use for communication with the client. (default: sse)',
     )
-    # OpenAI is the only supported LLM client
-    parser.add_argument('--model', help='Model name to use with the LLM client')
+    parser.add_argument(
+        '--model', help=f'Model name to use with the LLM client. (default: {DEFAULT_LLM_MODEL})'
+    )
+    parser.add_argument(
+        '--small-model',
+        help=f'Small model name to use with the LLM client. (default: {SMALL_LLM_MODEL})',
+    )
+    parser.add_argument(
+        '--temperature',
+        type=float,
+        help='Temperature setting for the LLM (0.0-2.0). Lower values make output more deterministic. (default: 0.7)',
+    )
     parser.add_argument('--destroy-graph', action='store_true', help='Destroy all Graphiti graphs')
     parser.add_argument(
         '--use-custom-entities',
         action='store_true',
         help='Enable entity extraction using the predefined ENTITY_TYPES',
     )
+    parser.add_argument(
+        '--host',
+        default=os.environ.get('MCP_SERVER_HOST'),
+        help='Host to bind the MCP server to (default: MCP_SERVER_HOST environment variable)',
+    )
 
     args = parser.parse_args()
 
-    # Set the group_id from CLI argument or generate a random one
+    # Build configuration from CLI arguments and environment variables
+    config = GraphitiConfig.from_cli_and_env(args)
+
+    # Log the group ID configuration
     if args.group_id:
-        config.group_id = args.group_id
         logger.info(f'Using provided group_id: {config.group_id}')
     else:
-        config.group_id = f'graph_{uuid.uuid4().hex[:8]}'
         logger.info(f'Generated random group_id: {config.group_id}')
 
-    # Set use_custom_entities flag if specified
-    if args.use_custom_entities:
-        config.use_custom_entities = True
+    # Log entity extraction configuration
+    if config.use_custom_entities:
         logger.info('Entity extraction enabled using predefined ENTITY_TYPES')
     else:
         logger.info('Entity extraction disabled (no custom entities will be used)')
 
-    llm_client = None
+    # Initialize Graphiti
+    await initialize_graphiti()
 
-    # Create OpenAI client if model is specified or if OPENAI_API_KEY is available
-    if args.model or config.openai_api_key:
-        # Override model from command line if specified
+    if args.host:
+        logger.info(f'Setting MCP server host to: {args.host}')
+        # Set MCP server host from CLI or env
+        mcp.settings.host = args.host
 
-        config.model_name = args.model or DEFAULT_LLM_MODEL
-
-        # Create the OpenAI client
-        llm_client = create_llm_client(api_key=config.openai_api_key, model=config.model_name)
-
-    # Initialize Graphiti with the specified LLM client
-    await initialize_graphiti(llm_client, destroy_graph=args.destroy_graph)
-
-    return MCPConfig(transport=args.transport)
+    # Return MCP configuration
+    return MCPConfig.from_cli(args)
 
 
 async def run_mcp_server():
