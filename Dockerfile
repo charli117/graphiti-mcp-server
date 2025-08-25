@@ -1,5 +1,4 @@
-# syntax=docker/dockerfile:1.9
-FROM python:3.12-slim
+FROM swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/python:3.12-slim
 
 WORKDIR /app
 
