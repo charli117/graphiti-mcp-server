@@ -42,7 +42,7 @@ RUN chown -Rv app:app /app
 USER app
 
 # Expose port
-EXPOSE 8000
+EXPOSE 8088
 
 # Command to run the application
 CMD ["uv", "run", "graphiti_mcp_server.py"]
