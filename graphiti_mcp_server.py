@@ -22,6 +22,7 @@ import anyio
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from starlette.responses import JSONResponse as StarletteJSONResponse
 from openai import AsyncAzureOpenAI
 from pydantic import BaseModel, Field
 
@@ -652,6 +653,8 @@ mcp = FastMCP(
     'Graphiti Agent Memory',
     instructions=GRAPHITI_MCP_INSTRUCTIONS
 )
+
+
 
 # Initialize Graphiti client and initialization status
 graphiti_client: Graphiti | None = None
@@ -1618,18 +1621,17 @@ async def clear_graph() -> SuccessResponse | ErrorResponse:
         return ErrorResponse(error=f'Error clearing graph: {error_msg}')
 
 
-@mcp.resource('http://graphiti/status')
-async def get_status() -> StatusResponse:
+async def get_status(request=None):
     """Get the status of the Graphiti MCP server and Neo4j connection."""
     global graphiti_client
 
     try:
         await ensure_initialization()
     except RuntimeError as e:
-        return StatusResponse(status='error', message=str(e))
+        return StarletteJSONResponse({'status': 'error', 'message': str(e)})
 
     if graphiti_client is None:
-        return StatusResponse(status='error', message='Graphiti client not initialized')
+        return StarletteJSONResponse({'status': 'error', 'message': 'Graphiti client not initialized'})
 
     try:
         # We've already checked that graphiti_client is not None above
@@ -1641,23 +1643,23 @@ async def get_status() -> StatusResponse:
         # Test database connection
         await client.driver.client.verify_connectivity()  # type: ignore
 
-        return StatusResponse(
-            status='ok', message='Graphiti MCP server is running and connected to Neo4j'
-        )
+        return StarletteJSONResponse({
+            'status': 'ok', 
+            'message': 'Graphiti MCP server is running and connected to Neo4j'
+        })
     except anyio.ClosedResourceError:
         logger.debug("SSE connection closed during status check")
-        return StatusResponse(status='error', message='Connection closed')
+        return StarletteJSONResponse({'status': 'error', 'message': 'Connection closed'})
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error checking Neo4j connection: {error_msg}')
-        return StatusResponse(
-            status='error',
-            message=f'Graphiti MCP server is running but Neo4j connection failed: {error_msg}',
-        )
+        return StarletteJSONResponse({
+            'status': 'error',
+            'message': f'Graphiti MCP server is running but Neo4j connection failed: {error_msg}',
+        })
 
 
-@mcp.resource('http://graphiti/healthcheck')
-async def healthcheck() -> HealthCheckResponse:
+async def healthcheck(request=None):
     """Health check endpoint for service monitoring and container orchestration."""
     global graphiti_client
 
@@ -1674,12 +1676,12 @@ async def healthcheck() -> HealthCheckResponse:
         # Check if basic initialization is complete
         if not initialization_complete:
             services['initialization'] = 'initializing'
-            return HealthCheckResponse(
-                status='starting',
-                timestamp=timestamp,
-                version=version,
-                services=services
-            )
+            return StarletteJSONResponse({
+                'status': 'starting',
+                'timestamp': timestamp,
+                'version': version,
+                'services': services
+            })
 
         services['initialization'] = 'ready'
 
@@ -1712,27 +1714,37 @@ async def healthcheck() -> HealthCheckResponse:
         else:
             overall_status = 'degraded'
 
-        return HealthCheckResponse(
-            status=overall_status,
-            timestamp=timestamp,
-            version=version,
-            services=services
-        )
+        return StarletteJSONResponse({
+            'status': overall_status,
+            'timestamp': timestamp,
+            'version': version,
+            'services': services
+        })
 
     except Exception as e:
         logger.error(f'Health check failed: {e}')
         services['healthcheck'] = 'error'
-        return HealthCheckResponse(
-            status='unhealthy',
-            timestamp=timestamp,
-            version=version,
-            services=services
-        )
+        return StarletteJSONResponse({
+            'status': 'unhealthy',
+            'timestamp': timestamp,
+            'version': version,
+            'services': services
+        })
 
 
-# Add root path handler to reduce 404 noise
-# Note: FastMCP doesn't expose direct app access, so we'll handle this differently
-# The 404 errors are normal for health checks and don't affect functionality
+def add_http_routes():
+    """Add HTTP routes using FastMCP's custom_route decorator"""
+    try:
+        # Use FastMCP's custom_route method to add routes
+        mcp.custom_route("/status", methods=["GET"])(get_status)
+        mcp.custom_route("/healthcheck", methods=["GET"])(healthcheck)
+        
+        logger.info("HTTP routes added successfully: /status, /healthcheck")
+    except Exception as e:
+        logger.error(f"Failed to add HTTP routes: {e}")
+
+
+# Note: HTTP endpoints are now added programmatically to FastMCP's FastAPI instance
 
 
 async def initialize_server() -> MCPConfig:
@@ -1805,6 +1817,9 @@ async def initialize_server() -> MCPConfig:
 
         # Set port to match docker-compose configuration
         mcp.settings.port = int(os.environ.get('MCP_SERVER_PORT', '8000'))
+        
+        # Add HTTP routes to FastMCP's internal FastAPI app
+        add_http_routes()
 
         # Return MCP configuration
         return MCPConfig.from_cli(args)
