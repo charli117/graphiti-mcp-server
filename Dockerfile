@@ -20,7 +20,9 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never \
     MCP_SERVER_HOST="0.0.0.0" \
-    PYTHONUNBUFFERED=1
+    MCP_SERVER_PORT="8000" \
+    PYTHONUNBUFFERED=1 \
+    LOG_LEVEL=INFO
 
 # Create non-root user
 RUN groupadd -r app && useradd -r -d /app -g app app
@@ -42,7 +44,7 @@ RUN chown -Rv app:app /app
 USER app
 
 # Expose port
-EXPOSE 8088
+EXPOSE 8000
 
 # Command to run the application
 CMD ["uv", "run", "graphiti_mcp_server.py"]

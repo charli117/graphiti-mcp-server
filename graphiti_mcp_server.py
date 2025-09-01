@@ -12,6 +12,13 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, TypedDict, cast
 
+# Import tomllib with backward compatibility
+try:
+    import tomllib  # Python 3.11+
+except ImportError:
+    import tomli as tomllib  # Python 3.10
+
+import anyio
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -37,15 +44,18 @@ from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 
 load_dotenv()
 
-
-DEFAULT_LLM_MODEL = 'gpt-4.1-mini'
-SMALL_LLM_MODEL = 'gpt-4.1-nano'
+DEFAULT_LLM_MODEL = 'gpt-4.1'
+SMALL_LLM_MODEL = 'gpt-4.1'
 DEFAULT_EMBEDDER_MODEL = 'text-embedding-3-small'
 
 # Semaphore limit for concurrent Graphiti operations.
 # Decrease this if you're experiencing 429 rate limit errors from your LLM provider.
 # Increase if you have high rate limits.
 SEMAPHORE_LIMIT = int(os.getenv('SEMAPHORE_LIMIT', 10))
+
+# Timeout configuration for Azure OpenAI requests
+AZURE_OPENAI_TIMEOUT = float(os.getenv('AZURE_OPENAI_TIMEOUT', 300.0))
+AZURE_OPENAI_MAX_RETRIES = int(os.getenv('AZURE_OPENAI_MAX_RETRIES', 5))
 
 
 class Requirement(BaseModel):
@@ -167,12 +177,32 @@ class StatusResponse(TypedDict):
     message: str
 
 
+class HealthCheckResponse(TypedDict):
+    status: str
+    timestamp: str
+    version: str | None
+    services: dict[str, str]
+
+
 def create_azure_credential_token_provider() -> Callable[[], str]:
     credential = DefaultAzureCredential()
     token_provider = get_bearer_token_provider(
         credential, 'https://cognitiveservices.azure.com/.default'
     )
     return token_provider
+
+
+def get_version() -> str | None:
+    """Get the version from pyproject.toml if available."""
+    try:
+        pyproject_path = os.path.join(os.path.dirname(__file__), 'pyproject.toml')
+        if os.path.exists(pyproject_path):
+            with open(pyproject_path, 'rb') as f:
+                data = tomllib.load(f)
+                return data.get('project', {}).get('version')
+    except Exception as e:
+        logger.debug(f'Could not read version from pyproject.toml: {e}')
+    return None
 
 
 # Server configuration classes
@@ -216,8 +246,22 @@ class GraphitiLLMConfig(BaseModel):
         azure_openai_api_version = os.environ.get('AZURE_OPENAI_API_VERSION', None)
         azure_openai_deployment_name = os.environ.get('AZURE_OPENAI_DEPLOYMENT_NAME', None)
         azure_openai_use_managed_identity = (
-            os.environ.get('AZURE_OPENAI_USE_MANAGED_IDENTITY', 'false').lower() == 'true'
+                os.environ.get('AZURE_OPENAI_USE_MANAGED_IDENTITY', 'false').lower() == 'true'
         )
+
+        # Validate and fix Azure OpenAI endpoint format if provided
+        if azure_openai_endpoint:
+            if not azure_openai_endpoint.endswith('/'):
+                azure_openai_endpoint += '/'
+                logger.info(f'Auto-corrected Azure OpenAI endpoint to include trailing slash: {azure_openai_endpoint}')
+            if '.openai.azure.com' not in azure_openai_endpoint:
+                logger.warning(f'Azure OpenAI endpoint may have incorrect format: {azure_openai_endpoint}')
+
+        # Log Azure OpenAI configuration for debugging
+        if azure_openai_endpoint:
+            logger.info(f'Using Azure OpenAI endpoint: {azure_openai_endpoint}')
+            logger.info(f'Azure OpenAI API version: {azure_openai_api_version}')
+            logger.info(f'Azure OpenAI deployment name: {azure_openai_deployment_name}')
 
         if azure_openai_endpoint is None:
             # Setup for OpenAI API
@@ -245,8 +289,10 @@ class GraphitiLLMConfig(BaseModel):
 
                 raise ValueError('AZURE_OPENAI_DEPLOYMENT_NAME environment variable not set')
             if not azure_openai_use_managed_identity:
-                # api key
-                api_key = os.environ.get('OPENAI_API_KEY', None)
+                # For Azure OpenAI, prioritize AZURE_OPENAI_API_KEY, then fall back to OPENAI_API_KEY
+                api_key = os.environ.get('AZURE_OPENAI_API_KEY') or os.environ.get('OPENAI_API_KEY', None)
+                if not api_key:
+                    logger.error('Neither AZURE_OPENAI_API_KEY nor OPENAI_API_KEY environment variable is set')
             else:
                 # Managed identity
                 api_key = None
@@ -296,24 +342,35 @@ class GraphitiLLMConfig(BaseModel):
         """
 
         if self.azure_openai_endpoint is not None:
+            # Validate required Azure OpenAI parameters
+            if not self.azure_openai_deployment_name:
+                raise ValueError('AZURE_OPENAI_DEPLOYMENT_NAME is required when using Azure OpenAI')
+            if not self.azure_openai_api_version:
+                raise ValueError('AZURE_OPENAI_API_VERSION is required when using Azure OpenAI')
             # Azure OpenAI API setup
             if self.azure_openai_use_managed_identity:
                 # Use managed identity for authentication
-                token_provider = create_azure_credential_token_provider()
-                return AzureOpenAILLMClient(
-                    azure_client=AsyncAzureOpenAI(
-                        azure_endpoint=self.azure_openai_endpoint,
-                        azure_deployment=self.azure_openai_deployment_name,
-                        api_version=self.azure_openai_api_version,
-                        azure_ad_token_provider=token_provider,
-                    ),
-                    config=LLMConfig(
-                        api_key=self.api_key,
-                        model=self.model,
-                        small_model=self.small_model,
-                        temperature=self.temperature,
-                    ),
-                )
+                try:
+                    token_provider = create_azure_credential_token_provider()
+                    return AzureOpenAILLMClient(
+                        azure_client=AsyncAzureOpenAI(
+                            azure_endpoint=self.azure_openai_endpoint,
+                            azure_deployment=self.azure_openai_deployment_name,
+                            api_version=self.azure_openai_api_version,
+                            azure_ad_token_provider=token_provider,
+                            timeout=AZURE_OPENAI_TIMEOUT,
+                            max_retries=AZURE_OPENAI_MAX_RETRIES,
+                        ),
+                        config=LLMConfig(
+                            api_key=self.api_key,
+                            model=self.azure_openai_deployment_name,  # Use deployment name for Azure
+                            small_model=self.small_model,
+                            temperature=self.temperature,
+                        ),
+                    )
+                except Exception as e:
+                    logger.error(f'Failed to create Azure managed identity token provider: {str(e)}')
+                    raise ValueError(f'Azure managed identity authentication failed: {str(e)}')
             elif self.api_key:
                 # Use API key for authentication
                 return AzureOpenAILLMClient(
@@ -322,16 +379,19 @@ class GraphitiLLMConfig(BaseModel):
                         azure_deployment=self.azure_openai_deployment_name,
                         api_version=self.azure_openai_api_version,
                         api_key=self.api_key,
+                        timeout=AZURE_OPENAI_TIMEOUT,
+                        max_retries=AZURE_OPENAI_MAX_RETRIES,
                     ),
                     config=LLMConfig(
                         api_key=self.api_key,
-                        model=self.model,
+                        model=self.azure_openai_deployment_name,  # Use deployment name for Azure
                         small_model=self.small_model,
                         temperature=self.temperature,
                     ),
                 )
             else:
-                raise ValueError('OPENAI_API_KEY must be set when using Azure OpenAI API')
+                raise ValueError(
+                    'API key must be set when using Azure OpenAI API (set AZURE_OPENAI_API_KEY or OPENAI_API_KEY)')
 
         if not self.api_key:
             raise ValueError('OPENAI_API_KEY must be set when using OpenAI API')
@@ -367,14 +427,21 @@ class GraphitiEmbedderConfig(BaseModel):
         model_env = os.environ.get('EMBEDDER_MODEL_NAME', '')
         model = model_env if model_env.strip() else DEFAULT_EMBEDDER_MODEL
 
-        azure_openai_endpoint = os.environ.get('AZURE_OPENAI_EMBEDDING_ENDPOINT', None)
-        azure_openai_api_version = os.environ.get('AZURE_OPENAI_EMBEDDING_API_VERSION', None)
-        azure_openai_deployment_name = os.environ.get(
-            'AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME', None
-        )
+        # Use the same Azure OpenAI configuration as LLM for embeddings
+        azure_openai_endpoint = os.environ.get('AZURE_OPENAI_ENDPOINT', None)
+        azure_openai_api_version = os.environ.get('AZURE_OPENAI_API_VERSION', None)
         azure_openai_use_managed_identity = (
-            os.environ.get('AZURE_OPENAI_USE_MANAGED_IDENTITY', 'false').lower() == 'true'
+                os.environ.get('AZURE_OPENAI_USE_MANAGED_IDENTITY', 'false').lower() == 'true'
         )
+
+        # Validate and fix Azure OpenAI endpoint format if provided  
+        if azure_openai_endpoint:
+            if not azure_openai_endpoint.endswith('/'):
+                azure_openai_endpoint += '/'
+                logger.debug(f'Auto-corrected Azure OpenAI endpoint for embeddings: {azure_openai_endpoint}')
+            if '.openai.azure.com' not in azure_openai_endpoint:
+                logger.warning(f'Azure OpenAI endpoint may have incorrect format: {azure_openai_endpoint}')
+
         if azure_openai_endpoint is not None:
             # Setup for Azure OpenAI API
             # Log if empty deployment name was provided
@@ -389,15 +456,16 @@ class GraphitiEmbedderConfig(BaseModel):
                 )
 
             if not azure_openai_use_managed_identity:
-                # api key
-                api_key = os.environ.get('AZURE_OPENAI_EMBEDDING_API_KEY', None) or os.environ.get(
-                    'OPENAI_API_KEY', None
-                )
+                # Use the same API key as LLM configuration
+                api_key = os.environ.get('AZURE_OPENAI_API_KEY') or os.environ.get('OPENAI_API_KEY', None)
+                if not api_key:
+                    logger.error('No API key found in AZURE_OPENAI_API_KEY or OPENAI_API_KEY')
             else:
                 # Managed identity
                 api_key = None
 
             return cls(
+                model=model,  # Include model for Azure OpenAI embeddings
                 azure_openai_use_managed_identity=azure_openai_use_managed_identity,
                 azure_openai_endpoint=azure_openai_endpoint,
                 api_key=api_key,
@@ -412,19 +480,33 @@ class GraphitiEmbedderConfig(BaseModel):
 
     def create_client(self) -> EmbedderClient | None:
         if self.azure_openai_endpoint is not None:
+            # Validate required Azure OpenAI parameters for embeddings
+            if not self.azure_openai_deployment_name:
+                logger.error('AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME is required when using Azure OpenAI embeddings')
+                raise ValueError(
+                    'AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME is required when using Azure OpenAI embeddings')
+            if not self.azure_openai_api_version:
+                logger.error('AZURE_OPENAI_API_VERSION is required when using Azure OpenAI embeddings')
+                raise ValueError('AZURE_OPENAI_API_VERSION is required when using Azure OpenAI embeddings')
             # Azure OpenAI API setup
             if self.azure_openai_use_managed_identity:
                 # Use managed identity for authentication
-                token_provider = create_azure_credential_token_provider()
-                return AzureOpenAIEmbedderClient(
-                    azure_client=AsyncAzureOpenAI(
-                        azure_endpoint=self.azure_openai_endpoint,
-                        azure_deployment=self.azure_openai_deployment_name,
-                        api_version=self.azure_openai_api_version,
-                        azure_ad_token_provider=token_provider,
-                    ),
-                    model=self.model,
-                )
+                try:
+                    token_provider = create_azure_credential_token_provider()
+                    return AzureOpenAIEmbedderClient(
+                        azure_client=AsyncAzureOpenAI(
+                            azure_endpoint=self.azure_openai_endpoint,
+                            azure_deployment=self.azure_openai_deployment_name,
+                            api_version=self.azure_openai_api_version,
+                            azure_ad_token_provider=token_provider,
+                            timeout=AZURE_OPENAI_TIMEOUT,
+                            max_retries=AZURE_OPENAI_MAX_RETRIES,
+                        ),
+                        model=self.azure_openai_deployment_name,  # Use deployment name for Azure
+                    )
+                except Exception as e:
+                    logger.error(f'Failed to create Azure managed identity token provider for embeddings: {str(e)}')
+                    raise ValueError(f'Azure managed identity authentication failed for embeddings: {str(e)}')
             elif self.api_key:
                 # Use API key for authentication
                 return AzureOpenAIEmbedderClient(
@@ -433,11 +515,14 @@ class GraphitiEmbedderConfig(BaseModel):
                         azure_deployment=self.azure_openai_deployment_name,
                         api_version=self.azure_openai_api_version,
                         api_key=self.api_key,
+                        timeout=AZURE_OPENAI_TIMEOUT,
+                        max_retries=AZURE_OPENAI_MAX_RETRIES,
                     ),
-                    model=self.model,
+                    model=self.azure_openai_deployment_name,  # Use deployment name for Azure
                 )
             else:
-                logger.error('OPENAI_API_KEY must be set when using Azure OpenAI API')
+                logger.error(
+                    'API key must be set when using Azure OpenAI API (set AZURE_OPENAI_API_KEY or OPENAI_API_KEY)')
                 return None
         else:
             # OpenAI API setup
@@ -568,13 +653,15 @@ mcp = FastMCP(
     instructions=GRAPHITI_MCP_INSTRUCTIONS
 )
 
-# Initialize Graphiti client
+# Initialize Graphiti client and initialization status
 graphiti_client: Graphiti | None = None
+initialization_complete: bool = False
+initialization_lock = asyncio.Lock()
 
 
 async def initialize_graphiti():
     """Initialize the Graphiti client with the configured settings."""
-    global graphiti_client, config
+    global graphiti_client, config, initialization_complete
 
     try:
         # Create LLM client if possible
@@ -621,9 +708,37 @@ async def initialize_graphiti():
         )
         logger.info(f'Using concurrency limit: {SEMAPHORE_LIMIT}')
 
+        # Mark initialization as complete
+        initialization_complete = True
+        logger.info('Graphiti initialization completed successfully')
+
     except Exception as e:
         logger.error(f'Failed to initialize Graphiti: {str(e)}')
+        initialization_complete = False
         raise
+
+
+async def ensure_initialization():
+    """Ensure Graphiti is fully initialized before processing requests."""
+    global initialization_complete, initialization_lock
+
+    if initialization_complete:
+        return
+
+    async with initialization_lock:
+        if not initialization_complete:
+            logger.warning("Request received before initialization complete, waiting...")
+            # Wait longer for initialization to complete
+            max_wait_time = 30  # 30 seconds maximum wait
+            wait_interval = 0.5  # Check every 500ms
+            total_waited = 0
+
+            while not initialization_complete and total_waited < max_wait_time:
+                await asyncio.sleep(wait_interval)
+                total_waited += wait_interval
+
+            if not initialization_complete:
+                raise RuntimeError(f"Graphiti initialization not complete after {max_wait_time} seconds")
 
 
 def format_fact_result(edge: EntityEdge) -> dict[str, Any]:
@@ -645,6 +760,25 @@ def format_fact_result(edge: EntityEdge) -> dict[str, Any]:
     )
     result.get('attributes', {}).pop('fact_embedding', None)
     return result
+
+
+def handle_sse_errors(func):
+    """Decorator to handle SSE connection errors gracefully."""
+
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except anyio.ClosedResourceError:
+            logger.debug("SSE connection closed during tool execution")
+            # Return appropriate error response based on function return type
+            return ErrorResponse(error="Connection closed")
+        except Exception as e:
+            # Re-raise other exceptions normally
+            raise e
+
+    wrapper.__name__ = func.__name__
+    wrapper.__doc__ = func.__doc__
+    return wrapper
 
 
 # Dictionary to store queues for each group_id
@@ -690,12 +824,12 @@ async def process_episode_queue(group_id: str):
 
 @mcp.tool()
 async def add_memory(
-    name: str,
-    episode_body: str,
-    group_id: str | None = None,
-    source: str = 'text',
-    source_description: str = '',
-    uuid: str | None = None,
+        name: str,
+        episode_body: str,
+        group_id: str | None = None,
+        source: str = 'text',
+        source_description: str = '',
+        uuid: str | None = None,
 ) -> SuccessResponse | ErrorResponse:
     """Add an episode to memory. This is the primary way to add information to the graph.
 
@@ -754,6 +888,11 @@ async def add_memory(
     """
     global graphiti_client, episode_queues, queue_workers
 
+    try:
+        await ensure_initialization()
+    except RuntimeError as e:
+        return ErrorResponse(error=str(e))
+
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
 
@@ -781,29 +920,106 @@ async def add_memory(
 
         # Define the episode processing function
         async def process_episode():
-            try:
-                logger.info(f"Processing queued episode '{name}' for group_id: {group_id_str}")
-                # Use all entity types if use_custom_entities is enabled, otherwise use empty dict
-                entity_types = ENTITY_TYPES if config.use_custom_entities else {}
+            max_retries = 5
+            retry_delay = 10  # seconds
 
-                await client.add_episode(
-                    name=name,
-                    episode_body=episode_body,
-                    source=source_type,
-                    source_description=source_description,
-                    group_id=group_id_str,  # Using the string version of group_id
-                    uuid=uuid,
-                    reference_time=datetime.now(timezone.utc),
-                    entity_types=entity_types,
-                )
-                logger.info(f"Episode '{name}' added successfully")
+            for attempt in range(max_retries):
+                try:
+                    logger.info(
+                        f"Processing queued episode '{name}' for group_id: {group_id_str} (attempt {attempt + 1}/{max_retries})")
+                    # Use all entity types if use_custom_entities is enabled, otherwise use empty dict
+                    entity_types = ENTITY_TYPES if config.use_custom_entities else {}
 
-                logger.info(f"Episode '{name}' processed successfully")
-            except Exception as e:
-                error_msg = str(e)
-                logger.error(
-                    f"Error processing episode '{name}' for group_id {group_id_str}: {error_msg}"
-                )
+                    # Add timeout for the add_episode operation - increased timeout
+                    await asyncio.wait_for(
+                        client.add_episode(
+                            name=name,
+                            episode_body=episode_body,
+                            source=source_type,
+                            source_description=source_description,
+                            group_id=group_id_str,  # Using the string version of group_id
+                            uuid=uuid,
+                            reference_time=datetime.now(timezone.utc),
+                            entity_types=entity_types,
+                        ),
+                        timeout=600.0  # 10 minutes timeout for the entire operation
+                    )
+                    logger.info(f"Episode '{name}' added successfully")
+                    return  # Success, exit the retry loop
+
+                except asyncio.TimeoutError:
+                    error_msg = f"Timeout processing episode '{name}' on attempt {attempt + 1}"
+                    logger.warning(error_msg)
+                    if attempt < max_retries - 1:
+                        logger.info(f"Retrying in {retry_delay} seconds...")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay = min(retry_delay * 1.5, 60)  # Exponential backoff with cap
+                    else:
+                        logger.error(f"Failed to process episode '{name}' after {max_retries} attempts: {error_msg}")
+
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.warning(f"Error processing episode '{name}' on attempt {attempt + 1}: {error_msg}")
+
+                    # Enhanced error categorization
+                    is_timeout_related = any(keyword in error_msg.lower() for keyword in [
+                        "timeout", "timed out", "connection timeout", "read timeout",
+                        "request timeout", "server timeout"
+                    ])
+                    is_rate_limit = any(keyword in error_msg.lower() for keyword in [
+                        "rate limit", "too many requests", "429", "quota exceeded"
+                    ])
+                    is_network_error = any(keyword in error_msg.lower() for keyword in [
+                        "connection", "network", "dns", "ssl", "certificate"
+                    ])
+                    is_deployment_error = any(keyword in error_msg.lower() for keyword in [
+                        "404", "resource not found", "deployment", "not found"
+                    ])
+                    is_auth_error = any(keyword in error_msg.lower() for keyword in [
+                        "401", "access denied", "invalid subscription key", "permission denied"
+                    ])
+
+                    if attempt < max_retries - 1:
+                        if is_timeout_related or is_rate_limit or is_network_error:
+                            # Longer delay for rate limits
+                            delay = retry_delay * 2 if is_rate_limit else retry_delay
+                            logger.info(
+                                f"Retrying in {delay} seconds... (Error type: {'rate_limit' if is_rate_limit else 'timeout/network'})")
+                            await asyncio.sleep(delay)
+                            retry_delay = min(retry_delay * 1.5, 60)  # Exponential backoff with cap
+                        elif is_deployment_error:
+                            # Azure deployment errors are not retryable
+                            logger.error(f"Azure OpenAI deployment error processing episode '{name}': {error_msg}")
+                            logger.error("Please check your Azure OpenAI deployment configuration:")
+                            logger.error(f"  - Endpoint: {config.llm.azure_openai_endpoint}")
+                            logger.error(f"  - Deployment name: {config.llm.azure_openai_deployment_name}")
+                            logger.error(f"  - API version: {config.llm.azure_openai_api_version}")
+                            logger.error(
+                                "Ensure the deployment exists and is properly configured in Azure OpenAI Studio")
+                            break
+                        elif is_auth_error:
+                            # Authentication errors are not retryable
+                            logger.error(f"Azure OpenAI authentication error processing episode '{name}': {error_msg}")
+                            logger.error("Please check your Azure OpenAI authentication configuration:")
+                            logger.error(f"  - Endpoint: {config.llm.azure_openai_endpoint}")
+                            logger.error(f"  - Using managed identity: {config.llm.azure_openai_use_managed_identity}")
+                            if not config.llm.azure_openai_use_managed_identity:
+                                api_key_configured = "✅ Set" if config.llm.api_key else "❌ Not set"
+                                logger.error(f"  - API key: {api_key_configured}")
+                                if config.llm.api_key:
+                                    logger.error(f"  - API key length: {len(config.llm.api_key)} characters")
+                            logger.error("Solutions:")
+                            logger.error("  1. Verify API key is correct and active")
+                            logger.error("  2. Check if endpoint region matches your subscription")
+                            logger.error("  3. Ensure subscription has access to Azure OpenAI")
+                            logger.error("  4. Test with curl command to verify credentials")
+                            break
+                        else:
+                            # For other non-retryable errors, fail immediately
+                            logger.error(f"Non-retryable error processing episode '{name}': {error_msg}")
+                            break
+                    else:
+                        logger.error(f"Failed to process episode '{name}' after {max_retries} attempts: {error_msg}")
 
         # Initialize queue for this group_id if it doesn't exist
         if group_id_str not in episode_queues:
@@ -826,13 +1042,178 @@ async def add_memory(
         return ErrorResponse(error=f'Error queuing episode task: {error_msg}')
 
 
+def validate_and_clean_input(value, param_name, expected_type=None, min_value=None, max_value=None):
+    """Validate and clean input parameters.
+    
+    Args:
+        value: The value to validate
+        param_name: Name of the parameter for error messages
+        expected_type: Expected type (e.g., str, int, list)
+        min_value: Minimum value for numeric types
+        max_value: Maximum value for numeric types
+    
+    Returns:
+        Cleaned and validated value
+    
+    Raises:
+        ValueError: If validation fails
+    """
+    if value is None:
+        return None
+
+    # Type validation and conversion
+    if expected_type:
+        if expected_type == str and not isinstance(value, str):
+            if hasattr(value, '__str__'):
+                value = str(value)
+            else:
+                raise ValueError(f"{param_name} must be a string")
+        elif expected_type == int:
+            if isinstance(value, str):
+                try:
+                    value = int(value)
+                except ValueError:
+                    raise ValueError(f"{param_name} must be an integer")
+            elif not isinstance(value, int):
+                raise ValueError(f"{param_name} must be an integer")
+        elif expected_type == list and not isinstance(value, list):
+            raise ValueError(f"{param_name} must be a list")
+
+    # Range validation for numeric types
+    if isinstance(value, (int, float)):
+        if min_value is not None and value < min_value:
+            raise ValueError(f"{param_name} must be >= {min_value}")
+        if max_value is not None and value > max_value:
+            raise ValueError(f"{param_name} must be <= {max_value}")
+
+    # String cleaning
+    if isinstance(value, str):
+        value = value.strip()
+        if not value and param_name != 'entity':  # entity can be empty string
+            return None
+
+    return value
+
+
+def create_error_response(error_msg: str, details: dict = None) -> ErrorResponse:
+    """Create a standardized error response with optional details.
+    
+    Args:
+        error_msg: The main error message
+        details: Optional dictionary of additional error details
+    
+    Returns:
+        ErrorResponse with formatted error message
+    """
+    if details:
+        detailed_msg = f"{error_msg}. Details: {details}"
+    else:
+        detailed_msg = error_msg
+
+    logger.error(f"API Error: {detailed_msg}")
+    return ErrorResponse(error=detailed_msg)
+
+
+def parse_mcp_parameters(args, kwargs, extra_kwargs, param_defaults):
+    """Enhanced parameter parsing with better error handling and fallback logic.
+    
+    Args:
+        args: Raw args parameter (could be string, dict, or None)
+        kwargs: Raw kwargs parameter (could be string, dict, or None)
+        extra_kwargs: Additional keyword arguments
+        param_defaults: Dictionary of default values for parameters
+    
+    Returns:
+        Dictionary of parsed parameters
+    """
+    import json
+
+    # Start with defaults
+    parsed_params = param_defaults.copy()
+
+    # Helper function to safely update parameters
+    def safe_update_params(source_dict, context=""):
+        for key, value in source_dict.items():
+            if key in parsed_params:
+                try:
+                    # Validate and clean the value based on parameter type
+                    if key == 'query':
+                        cleaned_value = validate_and_clean_input(value, key, str)
+                    elif key in ['max_nodes', 'max_facts']:
+                        cleaned_value = validate_and_clean_input(value, key, int, min_value=1, max_value=100)
+                    elif key == 'group_ids':
+                        cleaned_value = validate_and_clean_input(value, key, list)
+                    elif key in ['center_node_uuid', 'entity']:
+                        cleaned_value = validate_and_clean_input(value, key, str)
+                    else:
+                        cleaned_value = value
+
+                    # Only update if the cleaned value is valid
+                    if cleaned_value is not None and (cleaned_value != '' or key in ['entity']):
+                        parsed_params[key] = cleaned_value
+                        logger.debug(f"Updated {key} from {context}: {cleaned_value}")
+
+                except ValueError as e:
+                    logger.warning(f"Validation error for {key} from {context}: {e}")
+                    # Continue with default value
+                    continue
+
+    # Handle args parameter
+    if args is not None:
+        if isinstance(args, str):
+            # Try JSON parsing first
+            try:
+                args_dict = json.loads(args)
+                safe_update_params(args_dict, "args JSON")
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                # Fallback: treat as query string if it's a simple string
+                if args.strip():
+                    logger.info(f"Treating args as query string: {args}")
+                    try:
+                        cleaned_query = validate_and_clean_input(args, 'query', str)
+                        if cleaned_query:
+                            parsed_params['query'] = cleaned_query
+                    except ValueError as e:
+                        logger.warning(f"Query validation error: {e}")
+                else:
+                    logger.warning(f"Failed to parse args as JSON and string is empty: {args}")
+        elif isinstance(args, dict):
+            safe_update_params(args, "args dict")
+        else:
+            logger.warning(f"Unexpected args type: {type(args)}, value: {args}")
+
+    # Handle kwargs parameter
+    if kwargs is not None:
+        if isinstance(kwargs, str):
+            try:
+                kwargs_dict = json.loads(kwargs)
+                safe_update_params(kwargs_dict, "kwargs JSON")
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                logger.warning(f"Failed to parse kwargs as JSON: {kwargs}")
+        elif isinstance(kwargs, dict):
+            safe_update_params(kwargs, "kwargs dict")
+        else:
+            logger.warning(f"Unexpected kwargs type: {type(kwargs)}, value: {kwargs}")
+
+    # Handle extra kwargs
+    if extra_kwargs:
+        safe_update_params(extra_kwargs, "extra_kwargs")
+
+    return parsed_params
+
+
 @mcp.tool()
+@handle_sse_errors
 async def search_memory_nodes(
-    query: str,
-    group_ids: list[str] | None = None,
-    max_nodes: int = 10,
-    center_node_uuid: str | None = None,
-    entity: str = '',  # cursor seems to break with None
+        query: str = None,
+        group_ids: list[str] | None = None,
+        max_nodes: int = 10,
+        center_node_uuid: str | None = None,
+        entity: str = '',  # cursor seems to break with None
+        # Support for Cursor's MCP wrapper format
+        args: str = None,
+        kwargs: str = None,
+        **extra_kwargs
 ) -> NodeSearchResponse | ErrorResponse:
     """Search the graph memory for relevant node summaries.
     These contain a summary of all of a node's relationships with other nodes.
@@ -847,6 +1228,36 @@ async def search_memory_nodes(
         entity: Optional single entity type to filter results (permitted: "Preference", "Procedure")
     """
     global graphiti_client
+
+    # Enhanced parameter parsing with fallback logic
+    param_defaults = {
+        'query': query,
+        'group_ids': group_ids,
+        'max_nodes': max_nodes,
+        'center_node_uuid': center_node_uuid,
+        'entity': entity
+    }
+
+    try:
+        parsed_params = parse_mcp_parameters(args, kwargs, extra_kwargs, param_defaults)
+        query = parsed_params['query']
+        group_ids = parsed_params['group_ids']
+        max_nodes = parsed_params['max_nodes']
+        center_node_uuid = parsed_params['center_node_uuid']
+        entity = parsed_params['entity']
+    except Exception as e:
+        logger.error(f"Error parsing parameters: {e}")
+        # Continue with original parameters as fallback
+        pass
+
+    # Validate and clean required parameter
+    if query is None or (isinstance(query, str) and not query.strip()):
+        return ErrorResponse(error='query parameter is required and cannot be empty')
+
+    try:
+        await ensure_initialization()
+    except RuntimeError as e:
+        return ErrorResponse(error=str(e))
 
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
@@ -874,14 +1285,21 @@ async def search_memory_nodes(
         # Use cast to help the type checker understand that graphiti_client is not None
         client = cast(Graphiti, graphiti_client)
 
-        # Perform the search using the _search method
-        search_results = await client._search(
-            query=query,
-            config=search_config,
-            group_ids=effective_group_ids,
-            center_node_uuid=center_node_uuid,
-            search_filter=filters,
-        )
+        # Perform the search using the _search method with timeout
+        try:
+            search_results = await asyncio.wait_for(
+                client._search(
+                    query=query,
+                    config=search_config,
+                    group_ids=effective_group_ids,
+                    center_node_uuid=center_node_uuid,
+                    search_filter=filters,
+                ),
+                timeout=60.0  # 60 second timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f'Node search timed out for query: {query}')
+            return ErrorResponse(error='Search operation timed out')
 
         if not search_results.nodes:
             return NodeSearchResponse(message='No relevant nodes found', nodes=[])
@@ -908,11 +1326,16 @@ async def search_memory_nodes(
 
 
 @mcp.tool()
+@handle_sse_errors
 async def search_memory_facts(
-    query: str,
-    group_ids: list[str] | None = None,
-    max_facts: int = 10,
-    center_node_uuid: str | None = None,
+        query: str = None,
+        group_ids: list[str] | None = None,
+        max_facts: int = 10,
+        center_node_uuid: str | None = None,
+        # Support for Cursor's MCP wrapper format
+        args: str = None,
+        kwargs: str = None,
+        **extra_kwargs
 ) -> FactSearchResponse | ErrorResponse:
     """Search the graph memory for relevant facts.
 
@@ -924,13 +1347,47 @@ async def search_memory_facts(
     """
     global graphiti_client
 
+    # Enhanced parameter parsing with fallback logic
+    param_defaults = {
+        'query': query,
+        'group_ids': group_ids,
+        'max_facts': max_facts,
+        'center_node_uuid': center_node_uuid
+    }
+
+    try:
+        parsed_params = parse_mcp_parameters(args, kwargs, extra_kwargs, param_defaults)
+        query = parsed_params['query']
+        group_ids = parsed_params['group_ids']
+        max_facts = parsed_params['max_facts']
+        center_node_uuid = parsed_params['center_node_uuid']
+    except Exception as e:
+        logger.error(f"Error parsing parameters: {e}")
+        # Continue with original parameters as fallback
+        pass
+
+    # Validate and clean required parameter
+    if query is None or (isinstance(query, str) and not query.strip()):
+        return ErrorResponse(error='query parameter is required and cannot be empty')
+
+    try:
+        await ensure_initialization()
+    except RuntimeError as e:
+        return ErrorResponse(error=str(e))
+
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
 
     try:
-        # Validate max_facts parameter
-        if max_facts <= 0:
-            return ErrorResponse(error='max_facts must be a positive integer')
+        # Additional validation for max_facts parameter
+        try:
+            max_facts = validate_and_clean_input(max_facts, 'max_facts', int, min_value=1, max_value=100)
+        except ValueError as e:
+            return ErrorResponse(error=f'Invalid max_facts parameter: {str(e)}')
+
+        if max_facts is None or max_facts <= 0:
+            max_facts = 10  # Default value
+            logger.warning("Invalid max_facts, using default value: 10")
 
         # Use the provided group_ids or fall back to the default from config if none provided
         effective_group_ids = (
@@ -943,12 +1400,19 @@ async def search_memory_facts(
         # Use cast to help the type checker understand that graphiti_client is not None
         client = cast(Graphiti, graphiti_client)
 
-        relevant_edges = await client.search(
-            group_ids=effective_group_ids,
-            query=query,
-            num_results=max_facts,
-            center_node_uuid=center_node_uuid,
-        )
+        try:
+            relevant_edges = await asyncio.wait_for(
+                client.search(
+                    group_ids=effective_group_ids,
+                    query=query,
+                    num_results=max_facts,
+                    center_node_uuid=center_node_uuid,
+                ),
+                timeout=60.0  # 60 second timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f'Facts search timed out for query: {query}')
+            return ErrorResponse(error='Facts search operation timed out')
 
         if not relevant_edges:
             return FactSearchResponse(message='No relevant facts found', facts=[])
@@ -969,6 +1433,11 @@ async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
         uuid: UUID of the entity edge to delete
     """
     global graphiti_client
+
+    try:
+        await ensure_initialization()
+    except RuntimeError as e:
+        return ErrorResponse(error=str(e))
 
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
@@ -1000,6 +1469,11 @@ async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
     """
     global graphiti_client
 
+    try:
+        await ensure_initialization()
+    except RuntimeError as e:
+        return ErrorResponse(error=str(e))
+
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
 
@@ -1030,6 +1504,11 @@ async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
     """
     global graphiti_client
 
+    try:
+        await ensure_initialization()
+    except RuntimeError as e:
+        return ErrorResponse(error=str(e))
+
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
 
@@ -1054,7 +1533,7 @@ async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
 
 @mcp.tool()
 async def get_episodes(
-    group_id: str | None = None, last_n: int = 10
+        group_id: str | None = None, last_n: int = 10
 ) -> list[dict[str, Any]] | EpisodeSearchResponse | ErrorResponse:
     """Get the most recent memory episodes for a specific group.
 
@@ -1063,6 +1542,11 @@ async def get_episodes(
         last_n: Number of most recent episodes to retrieve (default: 10)
     """
     global graphiti_client
+
+    try:
+        await ensure_initialization()
+    except RuntimeError as e:
+        return ErrorResponse(error=str(e))
 
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
@@ -1109,6 +1593,11 @@ async def clear_graph() -> SuccessResponse | ErrorResponse:
     """Clear all data from the graph memory and rebuild indices."""
     global graphiti_client
 
+    try:
+        await ensure_initialization()
+    except RuntimeError as e:
+        return ErrorResponse(error=str(e))
+
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
 
@@ -1134,6 +1623,11 @@ async def get_status() -> StatusResponse:
     """Get the status of the Graphiti MCP server and Neo4j connection."""
     global graphiti_client
 
+    try:
+        await ensure_initialization()
+    except RuntimeError as e:
+        return StatusResponse(status='error', message=str(e))
+
     if graphiti_client is None:
         return StatusResponse(status='error', message='Graphiti client not initialized')
 
@@ -1150,6 +1644,9 @@ async def get_status() -> StatusResponse:
         return StatusResponse(
             status='ok', message='Graphiti MCP server is running and connected to Neo4j'
         )
+    except anyio.ClosedResourceError:
+        logger.debug("SSE connection closed during status check")
+        return StatusResponse(status='error', message='Connection closed')
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error checking Neo4j connection: {error_msg}')
@@ -1159,75 +1656,158 @@ async def get_status() -> StatusResponse:
         )
 
 
+@mcp.resource('http://graphiti/healthcheck')
+async def healthcheck() -> HealthCheckResponse:
+    """Health check endpoint for service monitoring and container orchestration."""
+    global graphiti_client
+
+    # Get current timestamp
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    # Get version information
+    version = get_version()
+
+    # Initialize service status dict
+    services = {}
+
+    try:
+        # Check if basic initialization is complete
+        if not initialization_complete:
+            services['initialization'] = 'initializing'
+            return HealthCheckResponse(
+                status='starting',
+                timestamp=timestamp,
+                version=version,
+                services=services
+            )
+
+        services['initialization'] = 'ready'
+
+        # Check Graphiti client status
+        if graphiti_client is None:
+            services['graphiti'] = 'unavailable'
+            services['neo4j'] = 'unknown'
+        else:
+            services['graphiti'] = 'ready'
+
+            # Test Neo4j connection (with timeout to avoid hanging)
+            try:
+                client = cast(Graphiti, graphiti_client)
+                await asyncio.wait_for(
+                    client.driver.client.verify_connectivity(),  # type: ignore
+                    timeout=5.0
+                )
+                services['neo4j'] = 'healthy'
+            except asyncio.TimeoutError:
+                services['neo4j'] = 'timeout'
+            except Exception as e:
+                logger.debug(f'Neo4j connection check failed: {e}')
+                services['neo4j'] = 'unhealthy'
+
+        # Determine overall status
+        if all(status in ['ready', 'healthy'] for status in services.values()):
+            overall_status = 'healthy'
+        elif any(status in ['unavailable', 'unhealthy'] for status in services.values()):
+            overall_status = 'unhealthy'
+        else:
+            overall_status = 'degraded'
+
+        return HealthCheckResponse(
+            status=overall_status,
+            timestamp=timestamp,
+            version=version,
+            services=services
+        )
+
+    except Exception as e:
+        logger.error(f'Health check failed: {e}')
+        services['healthcheck'] = 'error'
+        return HealthCheckResponse(
+            status='unhealthy',
+            timestamp=timestamp,
+            version=version,
+            services=services
+        )
+
+
+# Add root path handler to reduce 404 noise
+# Note: FastMCP doesn't expose direct app access, so we'll handle this differently
+# The 404 errors are normal for health checks and don't affect functionality
+
+
 async def initialize_server() -> MCPConfig:
     """Parse CLI arguments and initialize the Graphiti server configuration."""
-    global config
+    global config, initialization_lock
 
-    parser = argparse.ArgumentParser(
-        description='Run the Graphiti MCP server with optional LLM client'
-    )
-    parser.add_argument(
-        '--group-id',
-        help='Namespace for the graph. This is an arbitrary string used to organize related data. '
-        'If not provided, a random UUID will be generated.',
-    )
-    parser.add_argument(
-        '--transport',
-        choices=['sse', 'stdio'],
-        default='sse',
-        help='Transport to use for communication with the client. (default: sse)',
-    )
-    parser.add_argument(
-        '--model', help=f'Model name to use with the LLM client. (default: {DEFAULT_LLM_MODEL})'
-    )
-    parser.add_argument(
-        '--small-model',
-        help=f'Small model name to use with the LLM client. (default: {SMALL_LLM_MODEL})',
-    )
-    parser.add_argument(
-        '--temperature',
-        type=float,
-        help='Temperature setting for the LLM (0.0-2.0). Lower values make output more deterministic. (default: 0.7)',
-    )
-    parser.add_argument('--destroy-graph', action='store_true', help='Destroy all Graphiti graphs')
-    parser.add_argument(
-        '--use-custom-entities',
-        action='store_true',
-        help='Enable entity extraction using the predefined ENTITY_TYPES',
-    )
-    parser.add_argument(
-        '--host',
-        default=os.environ.get('MCP_SERVER_HOST'),
-        help='Host to bind the MCP server to (default: MCP_SERVER_HOST environment variable)',
-    )
+    async with initialization_lock:
+        parser = argparse.ArgumentParser(
+            description='Run the Graphiti MCP server with optional LLM client'
+        )
+        parser.add_argument(
+            '--group-id',
+            help='Namespace for the graph. This is an arbitrary string used to organize related data. '
+                 'If not provided, a random UUID will be generated.',
+        )
+        parser.add_argument(
+            '--transport',
+            choices=['sse', 'stdio'],
+            default='sse',
+            help='Transport to use for communication with the client. (default: sse)',
+        )
+        parser.add_argument(
+            '--model', help=f'Model name to use with the LLM client. (default: {DEFAULT_LLM_MODEL})'
+        )
+        parser.add_argument(
+            '--small-model',
+            help=f'Small model name to use with the LLM client. (default: {SMALL_LLM_MODEL})',
+        )
+        parser.add_argument(
+            '--temperature',
+            type=float,
+            help='Temperature setting for the LLM (0.0-2.0). Lower values make output more deterministic. (default: 0.7)',
+        )
+        parser.add_argument('--destroy-graph', action='store_true', help='Destroy all Graphiti graphs')
+        parser.add_argument(
+            '--use-custom-entities',
+            action='store_true',
+            help='Enable entity extraction using the predefined ENTITY_TYPES',
+        )
+        parser.add_argument(
+            '--host',
+            default=os.environ.get('MCP_SERVER_HOST'),
+            help='Host to bind the MCP server to (default: MCP_SERVER_HOST environment variable)',
+        )
 
-    args = parser.parse_args()
+        args = parser.parse_args()
 
-    # Build configuration from CLI arguments and environment variables
-    config = GraphitiConfig.from_cli_and_env(args)
+        # Build configuration from CLI arguments and environment variables
+        config = GraphitiConfig.from_cli_and_env(args)
 
-    # Log the group ID configuration
-    if args.group_id:
-        logger.info(f'Using provided group_id: {config.group_id}')
-    else:
-        logger.info(f'Generated random group_id: {config.group_id}')
+        # Log the group ID configuration
+        if args.group_id:
+            logger.info(f'Using provided group_id: {config.group_id}')
+        else:
+            logger.info(f'Generated random group_id: {config.group_id}')
 
-    # Log entity extraction configuration
-    if config.use_custom_entities:
-        logger.info('Entity extraction enabled using predefined ENTITY_TYPES')
-    else:
-        logger.info('Entity extraction disabled (no custom entities will be used)')
+        # Log entity extraction configuration
+        if config.use_custom_entities:
+            logger.info('Entity extraction enabled using predefined ENTITY_TYPES')
+        else:
+            logger.info('Entity extraction disabled (no custom entities will be used)')
 
-    # Initialize Graphiti
-    await initialize_graphiti()
+        # Initialize Graphiti
+        await initialize_graphiti()
 
-    if args.host:
-        logger.info(f'Setting MCP server host to: {args.host}')
-        # Set MCP server host from CLI or env
-        mcp.settings.host = args.host
+        if args.host:
+            logger.info(f'Setting MCP server host to: {args.host}')
+            # Set MCP server host from CLI or env
+            mcp.settings.host = args.host
 
-    # Return MCP configuration
-    return MCPConfig.from_cli(args)
+        # Set port to match docker-compose configuration
+        mcp.settings.port = int(os.environ.get('MCP_SERVER_PORT', '8000'))
+
+        # Return MCP configuration
+        return MCPConfig.from_cli(args)
 
 
 async def run_mcp_server():
